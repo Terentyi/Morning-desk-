@@ -1,0 +1,522 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from datetime import date
+import webbrowser
+
+# =========================
+# CONFIG
+# =========================
+OUT = Path("output")
+OUT.mkdir(exist_ok=True)
+
+today = date.today()
+
+asset_groups = {
+    "Commodities": {
+        "GC=F": "Gold",
+        "SI=F": "Silver",
+        "CL=F": "Crude Oil",
+        "TTF=F": "TTF Gas",
+    },
+    "Rates": {
+        "^TNX": "US 10Y Yield",
+        "MFR10.AS": "France 10Y OAT Yield",
+    },
+    "Credit": {
+        "HYG": "US High Yield",
+        "JNK": "US High Yield Alt",
+        "LQD": "US Investment Grade",
+    },
+    "France": {
+        "^FCHI": "CAC 40",
+        "EWQ": "France ETF",
+        "BNP.PA": "BNP Paribas",
+        "GLE.PA": "Societe Generale",
+        "MC.PA": "LVMH",
+        "TTE": "TotalEnergies",
+    },
+    "Russia Proxy": {
+        "RUB=X": "USD/RUB",
+    },
+    "Main Stocks": {
+        "SPY": "S&P 500",
+        "QQQ": "Nasdaq 100",
+        "XLE": "Energy Equities",
+        "XLF": "Financials",
+        "AAPL": "Apple",
+        "MSFT": "Microsoft",
+        "NVDA": "NVIDIA",
+    },
+}
+
+ticker_names = {
+    ticker: name
+    for group in asset_groups.values()
+    for ticker, name in group.items()
+}
+
+ticker_to_group = {
+    ticker: group_name
+    for group_name, group in asset_groups.items()
+    for ticker in group.keys()
+}
+
+tickers = list(ticker_names.keys())
+
+# =========================
+# 1) DOWNLOAD PRICES
+# =========================
+raw = yf.download(
+    tickers=tickers,
+    period="3mo",
+    interval="1d",
+    auto_adjust=False,
+    progress=False,
+    group_by="ticker",
+)
+
+price_rows = []
+
+for t in tickers:
+    try:
+        df = raw[t].reset_index().copy()
+    except Exception:
+        continue
+
+    if df.empty:
+        continue
+
+    if "Volume" not in df.columns:
+        df["Volume"] = np.nan
+
+    needed_cols = ["Date", "Close", "Volume"]
+    if not all(col in df.columns for col in needed_cols):
+        continue
+
+    df = df[needed_cols].copy()
+    df.columns = ["date", "close", "volume"]
+    df["ticker"] = t
+    df["name"] = ticker_names.get(t, t)
+    df["asset_class"] = ticker_to_group.get(t, "Other")
+    price_rows.append(df)
+
+if not price_rows:
+    raise ValueError("No price data downloaded from Yahoo Finance.")
+
+prices = pd.concat(price_rows, ignore_index=True)
+prices["date"] = pd.to_datetime(prices["date"])
+prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+prices["volume"] = pd.to_numeric(prices["volume"], errors="coerce")
+
+# =========================
+# 2) DOWNLOAD NEWS
+# =========================
+news_rows = []
+
+for t in tickers:
+    try:
+        tk = yf.Ticker(t)
+        items = tk.news or []
+    except Exception:
+        items = []
+
+    for n in items:
+        news_rows.append({
+            "ticker": t,
+            "name": ticker_names.get(t, t),
+            "asset_class": ticker_to_group.get(t, "Other"),
+            "timestamp": n.get("providerPublishTime"),
+            "headline": n.get("title"),
+            "source": n.get("publisher"),
+            "link": n.get("link"),
+        })
+
+news = pd.DataFrame(news_rows)
+
+if not news.empty:
+    news["timestamp"] = pd.to_datetime(news["timestamp"], unit="s", errors="coerce")
+    news = news.dropna(subset=["timestamp"])
+    news = news.sort_values("timestamp")
+
+    latest_news = (
+        news.groupby("ticker")
+        .tail(1)[["ticker", "name", "asset_class", "timestamp", "headline", "source", "link"]]
+        .sort_values(["asset_class", "ticker"])
+    )
+
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=1)
+    recent_news = news[news["timestamp"] >= cutoff].copy()
+else:
+    latest_news = pd.DataFrame(
+        columns=["ticker", "name", "asset_class", "timestamp", "headline", "source", "link"]
+    )
+    recent_news = pd.DataFrame(
+        columns=["ticker", "name", "asset_class", "timestamp", "headline", "source", "link"]
+    )
+
+# =========================
+# 3) COMPUTE RETURNS + VOLUME
+# =========================
+p = prices.sort_values(["ticker", "date"]).copy()
+
+p["ret_1d"] = p.groupby("ticker")["close"].pct_change(1)
+p["ret_5d"] = p.groupby("ticker")["close"].pct_change(5)
+
+p["vol_mean20"] = p.groupby("ticker")["volume"].transform(lambda s: s.rolling(20).mean())
+p["vol_std20"] = p.groupby("ticker")["volume"].transform(lambda s: s.rolling(20).std(ddof=0))
+
+p["vol_z"] = np.where(
+    p["vol_std20"] > 0,
+    (p["volume"] - p["vol_mean20"]) / p["vol_std20"],
+    np.nan
+)
+
+last_date = p["date"].max()
+last = p[p["date"] == last_date].copy()
+
+snapshot = last[
+    ["ticker", "name", "asset_class", "close", "volume", "ret_1d", "ret_5d", "vol_z"]
+].copy()
+
+top_1d = snapshot.sort_values("ret_1d", ascending=False).head(8)
+bot_1d = snapshot.sort_values("ret_1d", ascending=True).head(8)
+top_5d = snapshot.sort_values("ret_5d", ascending=False).head(8)
+bot_5d = snapshot.sort_values("ret_5d", ascending=True).head(8)
+vol_tbl = snapshot.sort_values("vol_z", ascending=False)
+
+commodities_tbl = snapshot[snapshot["asset_class"] == "Commodities"].copy()
+rates_tbl = snapshot[snapshot["asset_class"] == "Rates"].copy()
+credit_tbl = snapshot[snapshot["asset_class"] == "Credit"].copy()
+france_tbl = snapshot[snapshot["asset_class"] == "France"].copy()
+russia_tbl = snapshot[snapshot["asset_class"] == "Russia Proxy"].copy()
+stocks_tbl = snapshot[snapshot["asset_class"] == "Main Stocks"].copy()
+
+# =========================
+# 4) SUMMARY
+# =========================
+def fmt_pct(x):
+    if pd.isna(x):
+        return "n/a"
+    return f"{x * 100:.1f}%"
+
+def fmt_lvl(x):
+    if pd.isna(x):
+        return "n/a"
+    return f"{x:.2f}"
+
+bullets = []
+
+if not top_1d.empty:
+    bullets.append(
+        f"BIGGEST 1D MOVE: {top_1d.iloc[0]['name']} ({top_1d.iloc[0]['ticker']}) {fmt_pct(top_1d.iloc[0]['ret_1d'])}"
+    )
+
+if not commodities_tbl.empty:
+    x = commodities_tbl.sort_values("ret_1d", ascending=False).iloc[0]
+    bullets.append(f"COMMODITIES LEADER: {x['name']} {fmt_pct(x['ret_1d'])}")
+
+if not rates_tbl.empty:
+    x = rates_tbl.sort_values("ret_1d", ascending=False).iloc[0]
+    bullets.append(f"RATES WATCH: {x['name']} {fmt_pct(x['ret_1d'])}")
+
+if not credit_tbl.empty:
+    x = credit_tbl.sort_values("ret_1d", ascending=False).iloc[0]
+    bullets.append(f"CREDIT WATCH: {x['name']} {fmt_pct(x['ret_1d'])}")
+
+if not france_tbl.empty:
+    x = france_tbl.sort_values("ret_1d", ascending=False).iloc[0]
+    bullets.append(f"FRANCE WATCH: {x['name']} {fmt_pct(x['ret_1d'])}")
+
+if not russia_tbl.empty:
+    x = russia_tbl.iloc[0]
+    bullets.append(f"RUSSIA PROXY: {x['name']} last {fmt_lvl(x['close'])}, 1D {fmt_pct(x['ret_1d'])}")
+
+if not vol_tbl.empty and pd.notna(vol_tbl.iloc[0]["vol_z"]):
+    bullets.append(f"UNUSUAL VOLUME: {vol_tbl.iloc[0]['name']} z-score {vol_tbl.iloc[0]['vol_z']:.1f}")
+
+if not recent_news.empty:
+    bullets.append(f"NEWS FLOW: {len(recent_news)} headline(s) in last 24h")
+
+# =========================
+# 5) HTML HELPERS
+# =========================
+def table_html(df):
+    if df.empty:
+        return "<p class='nodata'>NO DATA AVAILABLE</p>"
+    return df.to_html(index=False, escape=False)
+
+def prep_snapshot_table(df):
+    if df.empty:
+        return df
+
+    out = df.copy()
+    out["last"] = out["close"].round(2)
+    out["ret_1d_%"] = (out["ret_1d"] * 100).round(2)
+    out["ret_5d_%"] = (out["ret_5d"] * 100).round(2)
+    out["vol_z"] = out["vol_z"].round(2)
+
+    return out[["name", "ticker", "last", "ret_1d_%", "ret_5d_%", "vol_z"]]
+
+def prep_return_table(df, ret_col):
+    if df.empty:
+        return df
+    out = df.copy()
+    out[f"{ret_col}_%"] = (out[ret_col] * 100).round(2)
+    return out[["asset_class", "name", "ticker", f"{ret_col}_%"]]
+
+def news_table_html(df):
+    if df.empty:
+        return "<p class='nodata'>NO NEWS AVAILABLE</p>"
+
+    tmp = df.copy()
+    tmp["headline"] = tmp.apply(
+        lambda r: (
+            f'<a href="{r["link"]}" target="_blank">{r["headline"]}</a>'
+            if pd.notna(r["link"]) else r["headline"]
+        ),
+        axis=1
+    )
+    tmp["timestamp"] = tmp["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+    return tmp[["asset_class", "name", "ticker", "timestamp", "headline", "source"]].to_html(
+        index=False, escape=False
+    )
+
+desk_watch = "<ul>"
+if not top_1d.empty:
+    desk_watch += f"<li>WATCH FOLLOW-THROUGH IN <b>{top_1d.iloc[0]['name']}</b>.</li>"
+if not credit_tbl.empty:
+    desk_watch += "<li>CHECK WHETHER CREDIT CONFIRMS OR CONTRADICTS THE EQUITY MOVE.</li>"
+if not rates_tbl.empty:
+    desk_watch += "<li>MONITOR US 10Y VS FRANCE 10Y FOR MACRO OVERLAY.</li>"
+if not russia_tbl.empty:
+    desk_watch += "<li>USE USD/RUB AS THE MAIN RUSSIA-SENSITIVE PROXY.</li>"
+if not latest_news.empty:
+    desk_watch += "<li>READ THE LATEST HEADLINES TO EXPLAIN PRICE ACTION.</li>"
+desk_watch += "</ul>"
+
+# =========================
+# 6) BUILD HTML
+# =========================
+html = f"""
+<html>
+<head>
+<meta charset="utf-8">
+<title>Morning Desk Pack</title>
+<style>
+body {{
+    font-family: "Arial", sans-serif;
+    margin: 0;
+    background: #0b0b0b;
+    color: #f2f2f2;
+}}
+.wrapper {{
+    max-width: 1500px;
+    margin: 0 auto;
+    padding: 18px;
+}}
+.topbar {{
+    background: #111111;
+    border-bottom: 2px solid #ff9900;
+    padding: 14px 18px;
+    margin-bottom: 16px;
+}}
+.topbar h1 {{
+    margin: 0;
+    font-size: 26px;
+    color: #ff9900;
+    letter-spacing: 0.5px;
+}}
+.small {{
+    color: #c7c7c7;
+    margin-top: 6px;
+    font-size: 13px;
+}}
+.grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+}}
+.card {{
+    background: #111111;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 12px 14px;
+    box-shadow: inset 0 0 0 1px #000000;
+}}
+.card h2, .card h3 {{
+    margin: 0 0 10px 0;
+    color: #ff9900;
+    font-size: 16px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}}
+.section-space {{
+    margin-top: 14px;
+}}
+table {{
+    border-collapse: collapse;
+    width: 100%;
+    background: #0f0f0f;
+}}
+th, td {{
+    border: 1px solid #2d2d2d;
+    padding: 6px 8px;
+    text-align: left;
+    font-size: 12px;
+}}
+th {{
+    background: #1a1a1a;
+    color: #ffcc66;
+    text-transform: uppercase;
+}}
+tr:nth-child(even) {{
+    background: #121212;
+}}
+a {{
+    color: #7cc7ff;
+    text-decoration: none;
+}}
+a:hover {{
+    text-decoration: underline;
+}}
+ul {{
+    margin: 0;
+    padding-left: 18px;
+    line-height: 1.6;
+}}
+li {{
+    color: #f2f2f2;
+    font-size: 13px;
+}}
+.nodata {{
+    color: #aaaaaa;
+    font-size: 12px;
+    margin: 0;
+}}
+.ribbon {{
+    background: #1a1a1a;
+    color: #ffcc66;
+    padding: 6px 10px;
+    font-size: 12px;
+    border-left: 4px solid #ff9900;
+    margin-bottom: 12px;
+}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="wrapper">
+    <h1>MORNING DESK PACK</h1>
+    <div class="small">Generated: {today.isoformat()} | Data as of: {last_date.date().isoformat()}</div>
+  </div>
+</div>
+
+<div class="wrapper">
+
+<div class="ribbon">CROSS-ASSET SNAPSHOT | COMMODITIES | RATES | CREDIT | FRANCE | RUSSIA PROXY | MAIN STOCKS</div>
+
+<div class="card">
+  <h2>Summary</h2>
+  <ul>
+    {''.join([f'<li>{b}</li>' for b in bullets])}
+  </ul>
+</div>
+
+<div class="section-space"></div>
+
+<div class="grid">
+  <div class="card">
+    <h3>Top Movers (1D)</h3>
+    {table_html(prep_return_table(top_1d, "ret_1d"))}
+  </div>
+  <div class="card">
+    <h3>Bottom Movers (1D)</h3>
+    {table_html(prep_return_table(bot_1d, "ret_1d"))}
+  </div>
+  <div class="card">
+    <h3>Top Movers (5D)</h3>
+    {table_html(prep_return_table(top_5d, "ret_5d"))}
+  </div>
+  <div class="card">
+    <h3>Bottom Movers (5D)</h3>
+    {table_html(prep_return_table(bot_5d, "ret_5d"))}
+  </div>
+</div>
+
+<div class="section-space"></div>
+<div class="card">
+  <h2>Commodities</h2>
+  {table_html(prep_snapshot_table(commodities_tbl))}
+</div>
+
+<div class="section-space"></div>
+<div class="grid">
+  <div class="card">
+    <h2>Rates</h2>
+    {table_html(prep_snapshot_table(rates_tbl))}
+  </div>
+  <div class="card">
+    <h2>Credit</h2>
+    {table_html(prep_snapshot_table(credit_tbl))}
+  </div>
+</div>
+
+<div class="section-space"></div>
+<div class="grid">
+  <div class="card">
+    <h2>France</h2>
+    {table_html(prep_snapshot_table(france_tbl))}
+  </div>
+  <div class="card">
+    <h2>Russia Proxy</h2>
+    {table_html(prep_snapshot_table(russia_tbl))}
+  </div>
+</div>
+
+<div class="section-space"></div>
+<div class="card">
+  <h2>Main Stocks</h2>
+  {table_html(prep_snapshot_table(stocks_tbl))}
+</div>
+
+<div class="section-space"></div>
+<div class="card">
+  <h2>Volume Surprises</h2>
+  {table_html(vol_tbl[["asset_class", "name", "ticker", "volume", "vol_z"]].head(10).assign(vol_z=vol_tbl.head(10)["vol_z"].round(2)))}
+</div>
+
+<div class="section-space"></div>
+<div class="card">
+  <h2>Latest Headlines</h2>
+  {news_table_html(latest_news)}
+</div>
+
+<div class="section-space"></div>
+<div class="card">
+  <h2>What To Watch</h2>
+  {desk_watch}
+</div>
+
+</div>
+</body>
+</html>
+"""
+
+# =========================
+# 7) SAVE FILES
+# =========================
+dated_file = OUT / f"morning_desk_pack_{today.isoformat()}.html"
+latest_file = OUT / "morning_desk_pack_latest.html"
+
+dated_file.write_text(html, encoding="utf-8")
+latest_file.write_text(html, encoding="utf-8")
+
+print("Wrote", dated_file)
+print("Wrote", latest_file)
+
+# =========================
+# 8) OPEN IN BROWSER
+# =========================
+webbrowser.open(latest_file.resolve().as_uri())
